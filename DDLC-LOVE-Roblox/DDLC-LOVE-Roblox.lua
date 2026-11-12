@@ -20,7 +20,7 @@
          workspace/DDLC-LOVE/
  CONTROLS (keyboard):
      Space / Enter ......... advance text, confirm
-     Esc / Backspace ....... cancel, hide text window
+     Left Ctrl / Backspace .. cancel, hide text window (back)
      1 or Shift ............ pause menu
      2 ..................... skip toggle
      3 ..................... auto-forward toggle
@@ -83,6 +83,23 @@ local hasNetwork = hasHttpGet or requestImpl ~= nil
 
 local function mkstatus(msg) session.lastStatus = msg end
 local print_ = print
+
+-- Roblox/Luau: collectgarbage requires a string arg; LÖVE game code calls it with none.
+do
+        local _cg = collectgarbage
+        collectgarbage = function(opt, arg)
+                if opt == nil or opt == "collect" then
+                        -- full cycle; Luau accepts "collect"
+                        local ok = pcall(_cg, "collect")
+                        if not ok then pcall(_cg) end
+                        return
+                end
+                local ok, a, b = pcall(_cg, opt, arg)
+                if ok then return a, b end
+                return 0
+        end
+end
+
 local warn_ = type(warn) == "function" and warn or print
 local warned = {}
 local function warnOnce(msg)
@@ -843,25 +860,49 @@ end
 
 -- binary asset cache ----------------------------------------------------------
 local uriCache = {}   -- cachePath -> rbxasset uri (getcustomasset)
-local function getAssetURI(url)
+local function organizedPath(url)
+        -- keep folder structure under workspace/DDLC-LOVE/assets/
+        return SAVE_DIR .. "assets/" .. url:gsub("[\\]+", "/")
+end
+
+local function getAssetURI(url, opts)
+        opts = opts or {}
+        local skipUri = opts.skipUri == true  -- preload can skip getcustomasset to go faster
         local ext = url:match("%.(%w+)$") or "bin"
         local cachePath = SAVE_DIR .. "cache/" .. urlHash(url) .. "." .. ext
-        if uriCache[cachePath] then return uriCache[cachePath] end
-        local realPath = resolveFilePath(cachePath)
+        local orgPath = organizedPath(url)
+
+        -- cache stores { uri, w, h } so sizes are never lost
+        local cached = uriCache[cachePath] or uriCache[orgPath]
+        if type(cached) == "table" and cached.uri then
+                return cached.uri, cached.w, cached.h
+        elseif type(cached) == "string" then
+                -- legacy string-only cache entry
+                return cached, nil, nil
+        end
+
+        local realPath = resolveFilePath(orgPath) or resolveFilePath(cachePath)
         local data = realPath and readFile(realPath) or nil
         if not data then
                 data = fetchFromBases(ASSET_BASES, url)
                 if data then
-                        local ok, used = writeFile(cachePath, data)
-                        if ok then realPath = used end
+                        local ok1, used1 = writeFile(orgPath, data)
+                        local ok2, used2 = writeFile(cachePath, data)
+                        if ok1 then realPath = used1
+                        elseif ok2 then realPath = used2 end
                 end
         end
-        if not data or not realPath then return nil, nil end
+        if not data or not realPath then return nil, nil, nil end
+        if skipUri then
+                return true, nil, nil  -- downloaded; URI + dims resolved on first real use
+        end
         local w, h = imageDims(data)
         if hasCustomAsset then
                 local ok, uri = pcall(getcustomasset, realPath)
                 if ok and type(uri) == "string" then
-                        uriCache[cachePath] = uri
+                        local entry = { uri = uri, w = w, h = h }
+                        uriCache[cachePath] = entry
+                        uriCache[orgPath] = entry
                         return uri, w, h
                 end
         end
@@ -1051,8 +1092,10 @@ do
                         end
                 end
 
+                -- Positions are relative to `area` (already placed at offX/offY on screen).
+                -- Do NOT add offX/offY again or sprites/UI shift and clip.
                 local function mapXY(x, y)
-                        return offX + x * sc, offY + y * sc
+                        return x * sc, y * sc
                 end
 
                 function GuiRenderer.setBackgroundColor(r, g, b)
@@ -1060,16 +1103,35 @@ do
                 end
 
                 function GuiRenderer.drawImage(img, x, y, sx, sy, r, g, b, a)
-                        if img.missing then return end
+                        if not img or img.missing then return end
+                        if not img.uri or img.uri == "" then return end
                         local it = newItem("img", "ImageLabel")
                         local px, py = mapXY(x, y)
-                        it.inst.Position = UDim2.fromOffset(px, py)
-                        it.inst.Size = UDim2.fromOffset(math.max(1, img.w * sx * sc), math.max(1, img.h * sy * sc))
-                        it.inst.Image = img.uri or ""
+                        local iw = (img.w and img.w > 1) and img.w or 720
+                        local ih = (img.h and img.h > 1) and img.h or 720
+                        -- Force identical pixel size for all character sheets (avoids face/body scale drift)
+                        if img._chrTag then
+                                iw, ih = 720, 720
+                        end
+                        local dw = math.max(1, math.floor(iw * sx * sc + 0.5))
+                        local dh = math.max(1, math.floor(ih * sy * sc + 0.5))
+                        -- Clear previous frame's image first so a pooled label never shows the wrong sprite
+                        if it._lastUri ~= img.uri then
+                                it.inst.Image = ""
+                                it._lastUri = img.uri
+                        end
+                        it.inst.Size = UDim2.fromOffset(dw, dh)
+                        it.inst.Position = UDim2.fromOffset(math.floor(px), math.floor(py))
+                        it.inst.AnchorPoint = Vector2.new(0, 0)
+                        it.inst.Image = img.uri
                         it.inst.ImageColor3 = Color3.new(clamp(r / 255, 0, 1), clamp(g / 255, 0, 1), clamp(b / 255, 0, 1))
                         it.inst.ImageTransparency = 1 - clamp(a / 255, 0, 1)
                         it.inst.BackgroundTransparency = 1
+                        it.inst.BorderSizePixel = 0
                         it.inst.ScaleType = Enum.ScaleType.Stretch
+                        pcall(function()
+                                it.inst.ResampleMode = Enum.ResamplerMode.Default
+                        end)
                 end
 
                 local function applyText(inst, text, px, py, font, r, g, b, a, wrapped, limit, align)
@@ -1081,6 +1143,11 @@ do
                         inst.TextXAlignment = align or Enum.TextXAlignment.Left
                         inst.TextWrapped = wrapped
                         inst.RichText = false
+                        -- subtle stroke only (replaces the old 5-layer outline)
+                        pcall(function()
+                                inst.TextStrokeTransparency = 0.35
+                                inst.TextStrokeColor3 = Color3.new(0, 0, 0)
+                        end)
                         inst.Position = UDim2.fromOffset(px, py)
                         if wrapped then
                                 inst.AutomaticSize = Enum.AutomaticSize.Y
@@ -1963,42 +2030,24 @@ unitimer = 0
 uniduration = 0.25
 
 function outlineText(text,x,y,type,arg1)
-	if g_system == 'PSP' or (settings.o == 1 and type ~= 'poemgame' and type ~= 'm_selected') then
+	-- Roblox port: single text draw (multi-offset outline looked like double text)
+	if style_edited and (type == 'c_disp' or type == 'printf') then
 		lg.setColor(0,0,0,alpha)
+	elseif type == 'ct' then
+		lg.setColor(255,255,255,alpha)
+	elseif type == 'poemgame' then
+		lg.setColor(255,255,255,alpha)
 	else
-		local addm = 1.5
-		if type == 'ct' then
-			lg.setColor(187,85,153,alpha)
-			addm = 2.35
-		elseif style_edited and (type == 'c_disp' or type == 'printf') then
-			lg.setColor(255,255,255,alpha)
-		elseif type == 'poemgame' then
-			lg.setColor(255,175,255,alpha)
-		else
-			lg.setColor(0,0,0,alpha)
-		end
-		if type == 'printf' and global_os ~= 'LOVE-WrapLua' then
-			lg.printf(text,x-addm,y,arg1)
-			lg.printf(text,x,y-addm,arg1)
-			lg.printf(text,x+addm,y,arg1)
-			lg.printf(text,x,y+addm,arg1)
-		else
-			lg.print(text,x-addm,y)
-			lg.print(text,x,y-addm)
-			lg.print(text,x+addm,y)
-			lg.print(text,x,y+addm)
-		end
-		if style_edited and (type == 'c_disp' or type == 'printf') then
-			lg.setColor(0,0,0,alpha)
-		else
-			lg.setColor(255,255,255,alpha)
-		end
+		lg.setColor(255,255,255,alpha)
+	end
+	-- name tag stays dark pink-ish readable on the namebox
+	if type == 'ct' then
+		lg.setColor(255,255,255,alpha)
 	end
 	if type == 'printf' and global_os ~= 'LOVE-WrapLua' then
 		lg.printf(text,x,y,arg1)
 	else
-		local printtext = lg.print(text,x,y)
-		pcall(printtext)
+		lg.print(text,x,y)
 	end
 end
 
@@ -2109,37 +2158,51 @@ function updateCharacter(set,a,b,px,py,chset)
 	set.b = b
 	
 	if px and xaload == 0 then
-		chset.x = set.x
 		chset.y = px*3.2
-		if chset.x < chset.y then
-			chset.z = chset.y - chset.x
-		elseif chset.x > chset.y then
-			chset.z = chset.x - chset.y
-		else
+		-- If this girl was hidden (off-screen), place her at the target immediately
+		-- so drawCharacter does not keep skipping her at x<=-675.
+		if (not set.x) or set.x <= -675 then
+			set.x = chset.y
+			chset.x = chset.y
 			chset.z = 0
+		else
+			chset.x = set.x
+			if chset.x < chset.y then
+				chset.z = chset.y - chset.x
+			elseif chset.x > chset.y then
+				chset.z = chset.x - chset.y
+			else
+				chset.z = 0
+			end
 		end
 	end
 	if py then set.y = py end
 end
 
 function updateSayori(a,b,px,py)
+	local changed = (s_Set.a ~= a) or (s_Set.b ~= (b or ''))
 	updateCharacter(s_Set,a,b,px,py,changeX.s)
-	if xaload == 0 then loadSayori() end
+	-- Always reload when pose/face changes (not only on xaload==0).
+	-- Skipping reload left stale body/face layers glued together wrong.
+	if xaload == 0 or changed then loadSayori() end
 end
 
 function updateYuri(a,b,px,py)
+	local changed = (y_Set.a ~= a) or (y_Set.b ~= (b or ''))
 	updateCharacter(y_Set,a,b,px,py,changeX.y)
-	if xaload == 0 then loadYuri() end
+	if xaload == 0 or changed then loadYuri() end
 end
 
 function updateNatsuki(a,b,px,py)
+	local changed = (n_Set.a ~= a) or (n_Set.b ~= (b or ''))
 	updateCharacter(n_Set,a,b,px,py,changeX.n)
-	if xaload == 0 then loadNatsuki() end
+	if xaload == 0 or changed then loadNatsuki() end
 end
 
 function updateMonika(a,b,px,py)
+	local changed = (m_Set.a ~= a) or (m_Set.b ~= (b or ''))
 	updateCharacter(m_Set,a,b,px,py,changeX.m)
-	if xaload == 0 then loadMonika() end
+	if xaload == 0 or changed then loadMonika() end
 end
 
 function hideCharacter(set,chset)
@@ -2147,6 +2210,9 @@ function hideCharacter(set,chset)
 		chset.x = set.x
 		chset.y = -675
 		chset.z = chset.x - chset.y
+		-- Roblox: finish the slide in one step so the previous girl does not linger
+		-- over the next speaker. Keep pose data until fully off; drawCharacter skips x<=-675.
+		set.x = -675
 	end
 end
 
@@ -2167,44 +2233,58 @@ function hideMonika()
 end
 
 function hideAll()
-	s_Set = {a='',b='',x=-675,y=4}
-	y_Set = {a='',b='',x=-675,y=4}
-	n_Set = {a='',b='',x=-675,y=4}
-	m_Set = {a='',b='',x=-675,y=4}
+	s_Set = {a='',b='',x=-675,y=4,_chr='sayori'}
+	y_Set = {a='',b='',x=-675,y=4,_chr='yuri'}
+	n_Set = {a='',b='',x=-675,y=4,_chr='natsuki'}
+	m_Set = {a='',b='',x=-675,y=4,_chr='monika'}
 	unloadAll()
 end
 
 function drawCharacter(l,r,a,set,chset)
+	-- Match upstream DDLC-LOVE draw.lua: face first, then body at same x,y.
+	if not set or set.a == nil or set.a == '' then
+		return
+	end
+	-- Hidden off the left edge
+	if set.x ~= nil and set.x <= -675 then
+		return
+	end
 	set.y = 0
-	if set.b~='' then
-		if set == n_Set and (n_Set.a=='5' or n_Set.a=='5b') then --set natsuki's head x and y pos
+
+	if set.b and set.b ~= '' and a and not a.missing then
+		if set == n_Set and (n_Set.a == '5' or n_Set.a == '5b') then
 			xh = set.x + 14
 			yh = set.y + 18
 		else
 			xh = set.x
 			yh = set.y
 		end
-		if a then lg.draw(a,xh,yh) end
+		lg.draw(a, xh, yh)
 	end
-	
-	lg.draw(l, set.x, set.y)
-	
+
+	if l and not l.missing then
+		lg.draw(l, set.x, set.y)
+	end
+
 	local with_set = with_r
-	if set == y_Set then
+	if set == y_Set or (set._chr == 'yuri') then
 		with_set = with_yr
 	end
-	for i = 1, #with_set do
-		if with_set[i] == set.a then
-			lg.draw(r,set.x,set.y)
+	if r and not r.missing then
+		for i = 1, #with_set do
+			if with_set[i] == set.a then
+				lg.draw(r, set.x, set.y)
+				break
+			end
 		end
 	end
-	
+
 	if set.x ~= chset.y and (autoskip >= 1 or unitimer >= uniduration) then
 		set.x = chset.y
-	elseif set.x < chset.y and not nearest(set.x,chset.y) then
-		set.x = math.ceil(chset.x + easeQuadInOut(unitimer,0,chset.z,uniduration))
-	elseif set.x > chset.y and not nearest(set.x,chset.y) then
-		set.x = math.floor(chset.x - easeQuadInOut(unitimer,0,chset.z,uniduration))
+	elseif set.x < chset.y and not nearest(set.x, chset.y) then
+		set.x = math.ceil(chset.x + easeQuadInOut(unitimer, 0, chset.z, uniduration))
+	elseif set.x > chset.y and not nearest(set.x, chset.y) then
+		set.x = math.floor(chset.x - easeQuadInOut(unitimer, 0, chset.z, uniduration))
 	end
 end
 
@@ -2543,7 +2623,7 @@ function audioUpdate(audiox, forceload) --audio changes
 					audio_bgmloop = love.audio.newSource('assets/audio/bgm/7-loop'..audio_ext, 'stream')
 				end
 			elseif audiox ~= 'credits' and audiox ~= 'end-voice' and audiox ~= '6r' then
-				audio_bgm:setLooping(true)
+				if audio_bgm then audio_bgm:setLooping(true) end
 			end
 			for i = 1, #audio_wloop do
 				if audiox == audio_wloop[i] then
@@ -2551,11 +2631,11 @@ function audioUpdate(audiox, forceload) --audio changes
 				end
 			end
 			if audio_bgmloop then
-				audio_bgm:setLooping(false)
-				audio_bgmloop:setLooping(true)
+				if audio_bgm then audio_bgm:setLooping(false) end
+				if audio_bgmloop then audio_bgmloop:setLooping(true) end
 			end
 			game_setvolume()
-			audio_bgm:play()
+			if audio_bgm then audio_bgm:play() end
 		end
 	end
 	audio1 = audiox
@@ -2570,8 +2650,8 @@ function sfxplay(sfx) --sfx stuff
 		end
 		if sfxp then
 			sfxp:setVolume((settings.sfxvol/100)*(settings.masvol/100))
+			sfxp:play()
 		end
-		sfxp:play()
 	end
 end
 
@@ -2586,22 +2666,32 @@ function sfxplay2(sfx)
 end
 ]=],
 ["loader/characters.lua"] = [=[
-function loadCharacter(set)
-	local chr
+function loadCharacter(set, chrName)
+	local chr = chrName
 	local lr = {'',''}
 	local asset1
 	local asset2
 	local asset3
 	
-	if set == s_Set then
-		chr = 'sayori'
-	elseif set == y_Set then
-		chr = 'yuri'
-	elseif set == n_Set then
-		chr = 'natsuki'
-	elseif set == m_Set then
-		chr = 'monika'
+	-- Prefer explicit name; fall back to table identity; then to set._chr
+	if not chr or chr == '' then
+		if set == s_Set then
+			chr = 'sayori'
+		elseif set == y_Set then
+			chr = 'yuri'
+		elseif set == n_Set then
+			chr = 'natsuki'
+		elseif set == m_Set then
+			chr = 'monika'
+		elseif set and set._chr then
+			chr = set._chr
+		end
 	end
+	if not chr then
+		print('[DDLC-LOVE] loadCharacter: unknown character set')
+		return nil, nil, nil
+	end
+	if set then set._chr = chr end
 	
 	if set.a == '1' then
 		lr = {'1l','1r'}
@@ -2633,20 +2723,33 @@ function loadCharacter(set)
 		lr = {set.a,''}
 	end
 	
-	asset1 = lgnewImage('assets/images/'..chr..'/'..lr[1]..'.png')
+	local function loadLayer(file)
+		local img = lgnewImage('assets/images/'..chr..'/'..file..'.png')
+		if img and img.missing then
+			-- drop path-cache miss and retry once
+			imagePathCache['assets/images/'..chr..'/'..file..'.png'] = nil
+			img = lgnewImage('assets/images/'..chr..'/'..file..'.png')
+		end
+		return img
+	end
+	asset1 = loadLayer(lr[1])
 	if lr[2] ~= '' then
-		asset2 = lgnewImage('assets/images/'..chr..'/'..lr[2]..'.png')
+		asset2 = loadLayer(lr[2])
 	end
 	if set.b ~= '' then
-		asset3 = lgnewImage('assets/images/'..chr..'/'..set.b..'.png')
+		asset3 = loadLayer(set.b)
 	end
-	
+	local tag = chr .. '|' .. tostring(set.a) .. '|' .. tostring(set.b)
+	if asset1 and not asset1.missing then asset1._chrTag = tag end
+	if asset2 and not asset2.missing then asset2._chrTag = tag end
+	if asset3 and not asset3.missing then asset3._chrTag = tag end
 	return asset1, asset2, asset3
 end
 
 function loadSayori()
 	unloadSayori()
-	sl, sr, s_a = loadCharacter(s_Set)
+	s_Set._chr = 'sayori'
+	sl, sr, s_a = loadCharacter(s_Set, 'sayori')
 end
 
 function unloadSayori()
@@ -2656,9 +2759,10 @@ function unloadSayori()
 	sl, sr, s_a = nil
 end
 
-function loadYuri()	
+function loadYuri()
 	unloadYuri()
-	yl, yr, y_a = loadCharacter(y_Set)
+	y_Set._chr = 'yuri'
+	yl, yr, y_a = loadCharacter(y_Set, 'yuri')
 end
 
 function unloadYuri()
@@ -2670,7 +2774,8 @@ end
 
 function loadNatsuki()
 	unloadNatsuki()
-	nl, nr, n_a = loadCharacter(n_Set)
+	n_Set._chr = 'natsuki'
+	nl, nr, n_a = loadCharacter(n_Set, 'natsuki')
 end
 
 function unloadNatsuki()
@@ -2682,7 +2787,8 @@ end
 
 function loadMonika()
 	unloadMonika()
-	ml, mr, m_a = loadCharacter(m_Set)
+	m_Set._chr = 'monika'
+	ml, mr, m_a = loadCharacter(m_Set, 'monika')
 end
 
 function unloadMonika()
@@ -3364,7 +3470,7 @@ function love.keypressed(key)
 	if global_os ~= "LOVE-WrapLua" and g_system ~= "Switch" then
 		if key == "space" or key == "return" then
 			key = "a"
-		elseif key == "escape" or key == "backspace" then
+		elseif key == "escape" or key == "backspace" or key == "lctrl" or key == "leftcontrol" then
 			key = "b"
 		elseif key == "1" or key == "lshift" or key == "rshift" then
 			key = "y"
@@ -3488,7 +3594,20 @@ local hold = {0,0,0,0}
 menu_alpha = 0
 
 function savepicLoad(i)
-	save_bpic[i] = lgnewImage('assets/images/bg/save/'..loadstring('return save'..chch..'.bg1')()..'.jpg')
+	local bgname = 'black'
+	local ok, res = pcall(function()
+		return loadstring('return save'..chch..'.bg1')()
+	end)
+	if ok and res and res ~= '' then bgname = tostring(res) end
+	-- Prefer dedicated save thumbnail; fall back to full background art
+	local thumb = lgnewImage('assets/images/bg/save/'..bgname..'.jpg')
+	if not thumb or thumb.missing then
+		thumb = lgnewImage('assets/images/bg/'..bgname..'.jpg')
+	end
+	if not thumb or thumb.missing then
+		thumb = lgnewImage('assets/images/bg/black.jpg')
+	end
+	save_bpic[i] = thumb
 end
 
 function savepicFree()
@@ -3543,7 +3662,7 @@ function menu_enable(m)
 		itemnames = {'','','','',''}
 		
 	elseif menu_type == 'settings' then
-		itemnames = {'Text Speed','Auto-Forward Time','Characters','Language','Master Volume','Music Volume','Sound Volume'}
+		itemnames = {'Text Speed','Auto-Forward Time','Characters','Language','Master Volume','Music Volume','Sound Volume','Back'}
 	
 	elseif menu_type == 'characters' then
 		itemnames = {tr.menuitem[3]..'monika.chr',tr.menuitem[3]..'natsuki.chr',tr.menuitem[3]..'sayori.chr',tr.menuitem[3]..'yuri.chr',tr.menuitem[4]}
@@ -3578,8 +3697,9 @@ function menu_enable(m)
 		end
 	end
 	
-	if sxp > 0 and menu_type == 'title' then
-		m_select(3)
+	-- Always start on New Game; player chooses Load/Settings themselves
+	if menu_type == 'title' or menu_type == 'pause' then
+		m_select(2)
 	else
 		m_select(2)
 	end
@@ -3723,8 +3843,6 @@ function menu_draw()
 			save_hoverpos.x = save_oset.x[m_selected-4]
 			save_hoverpos.y = save_oset.y[2]
 		end
-		lg.draw(gui.slothover,save_hoverpos.x,save_hoverpos.y-50)
-		
 		for i = 1, 6 do
 			local apx={x=0,y=0}
 			if i >= 1 and i <= 3 then
@@ -3737,7 +3855,13 @@ function menu_draw()
 			lg.setColor(236,182,229,menu_alpha)
 			lg.rectangle("fill",apx.x+10,apx.y-40,256,144)
 			lg.setColor(255,255,255,menu_alpha)
-			lg.draw(save_bpic[i],apx.x+10,apx.y-40)
+			if save_bpic[i] and not save_bpic[i].missing then
+				local iw = save_bpic[i].w or 256
+				local ih = save_bpic[i].h or 144
+				if iw < 2 then iw = 256 end
+				if ih < 2 then ih = 144 end
+				lg.draw(save_bpic[i], apx.x+10, apx.y-40, 0, 256/iw, 144/ih)
+			end
 			lg.setColor(0,0,0,menu_alpha)
 			lg.print(savenum[i]..': '..save_date[i],(apx.x+10),(apx.y+110))
 		end
@@ -3749,8 +3873,11 @@ function menu_draw()
 			lg.print("1\t2\t3\t4\t5\t6\t7\t8\t9\t10",627,660)
 		end
 		
-		lg.setColor(255,255,255,128)
-		lg.rectangle("fill",save_hoverpos.x+10,save_hoverpos.y-40,256,144)
+		-- Selection frame only (do not cover the preview image)
+		lg.setColor(255,255,255,220)
+		lg.rectangle("line",save_hoverpos.x+8,save_hoverpos.y-42,260,148)
+		lg.setColor(255,180,220,90)
+		lg.rectangle("line",save_hoverpos.x+6,save_hoverpos.y-44,264,152)
 		
 	elseif menu_type == 'settings' then
 		menu_drawstuff('overlay')
@@ -3758,6 +3885,13 @@ function menu_draw()
 		gui.gamemenu = gui.settings
 		lg.draw(gui.settings)
 		lg.draw(gui.setbuttons)
+		-- Visible leave-settings control
+		lg.setColor(255,189,225,menu_alpha)
+		lg.rectangle('fill', 40, 650, 220, 40)
+		lg.setColor(255,230,244,menu_alpha)
+		lg.rectangle('fill', 44, 654, 212, 32)
+		lg.setColor(0,0,0,menu_alpha)
+		lg.print('Back (LCtrl)', 55, 658)
 		local hv = {x=0,y=0}
 		if m_selected <= 5 then
 			hv.x = 340
@@ -3920,8 +4054,9 @@ function menu_confirm()
 					input["isPassword"] = false
 					love.keyboard.setTextInput(input)
 				else
-					require('keyboard')
-					keyboard = true
+					-- Roblox port: skip on-screen keyboard, use default name
+					player = (player ~= '' and player) or "Player"
+					changeState('game',1)
 				end
 			end
 			menu_previous = nil
@@ -4013,12 +4148,25 @@ function menu_confirm()
 		end
 		
 	elseif menu_type == 'settings' then
-		if m_selected <= 3 and m_selected >= 6 then
-			menu_keypressed('left')
-		elseif m_selected == 4 then
+		if m_selected == 4 then
 			menu_enable('characters')
 		elseif m_selected == 5 and g_system ~= 'Switch' then
 			changeState('language')
+		elseif m_selected == 9 then
+			-- Back
+			savesettings()
+			local prev = menu_previous
+			if not prev or prev == 'settings' then
+				if state == 'title' or state == 'splash' or state == 'splash2' then
+					prev = 'title'
+				else
+					prev = 'pause'
+				end
+			end
+			menu_previous = nil
+			menu_enable(prev)
+		elseif m_selected >= 2 and m_selected <= 8 then
+			-- value rows use left/right; confirm is a no-op (keeps selection)
 		end
 		
 	elseif menu_type == 'characters' then
@@ -4118,8 +4266,32 @@ function menu_keypressed(key)
 		end
 		if menu_type == 'pause' then
 			menu_fadeout = true
+		elseif menu_type == 'settings' or menu_type == 'characters' or menu_type == 'savegame' or menu_type == 'loadgame' or menu_type == 'help' or menu_type == 'history' or menu_type == 'mainyesno' or menu_type == 'quityesno' then
+			local prev = menu_previous
+			if not prev or prev == menu_type then
+				if state == 'title' or state == 'splash' or state == 'splash2' then
+					prev = 'title'
+				else
+					prev = 'pause'
+				end
+			end
+			menu_previous = nil
+			savepicFree()
+			if prev == 'title' then
+				menu_enable('title')
+			elseif prev == 'pause' then
+				menu_enable('pause')
+			else
+				menu_enable(prev)
+			end
+			if m_selected2 then
+				m_selected = m_selected2
+				m_select()
+				m_selected2 = nil
+			end
+			return
 		elseif menu_type ~= 'title' and menu_type ~= 'pause' and menu_type ~= 'choice' and menu_type ~= 'language' then
-			menu_enable(menu_previous)
+			menu_enable(menu_previous or 'pause')
 		end
 		savepicFree()
 		if m_selected2 then
@@ -65330,26 +65502,71 @@ end
 
 function LG.getFont() return curFont end
 
+-- Stable image cache by game path (same path => same table / dims)
+-- global: embedded loadCharacter must be able to clear failed entries
+imagePathCache = {}
+
+function LG.clearImage(path)
+        if path then imagePathCache[tostring(path)] = nil end
+end
 function LG.newImage(path)
+        path = tostring(path or "")
+        if imagePathCache[path] then
+                return imagePathCache[path]
+        end
         local pseudo = PSEUDO[path]
         if pseudo then
-                return { pseudo = pseudo, w = 1280, h = 720 }
+                local img = { pseudo = pseudo, w = 1280, h = 720 }
+                imagePathCache[path] = img
+                return img
         end
         local rel, _ext = mapAssetURL(path)
         if not rel then
                 return { missing = true, w = 1, h = 1 }
         end
         local uri, w, h = getAssetURI(rel)
-        if not uri and not w then
+        -- Retry once on failure (transient CDN / getcustomasset issues)
+        if (not uri or uri == true) and (not w) then
+                uri, w, h = getAssetURI(rel)
+        end
+        -- if dims missing (legacy cache), re-read file header
+        if (not w or not h or w < 8 or h < 8) then
+                local orgPath = organizedPath(rel)
+                local cachePath = SAVE_DIR .. "cache/" .. urlHash(rel) .. "." .. (rel:match("%.(%w+)$") or "bin")
+                local realPath = resolveFilePath(orgPath) or resolveFilePath(cachePath)
+                local data = realPath and readFile(realPath) or nil
+                if data then
+                        local dw, dh = imageDims(data)
+                        if dw and dh and dw >= 8 and dh >= 8 then
+                                w, h = dw, dh
+                                if type(uri) == "string" then
+                                        local entry = { uri = uri, w = w, h = h }
+                                        uriCache[cachePath] = entry
+                                        uriCache[orgPath] = entry
+                                end
+                        end
+                end
+        end
+        if uri == true then uri = nil end
+        if not uri then
                 warnOnce("image unavailable: " .. path)
+                -- do NOT cache misses so a later call can retry
                 return { missing = true, w = 1, h = 1 }
         end
-        return {
+        -- Character sheets in the Switch asset pack are always 720x720
+        local isChar = rel:find("/sayori/") or rel:find("/natsuki/") or rel:find("/yuri/") or rel:find("/monika/")
+        local dw = (w and w > 1) and w or (isChar and 720 or 1)
+        local dh = (h and h > 1) and h or (isChar and 720 or 1)
+        if isChar then dw, dh = 720, 720 end
+        local img = {
                 url = ASSET_BASES[1] .. "/" .. rel,
                 uri = uri,
-                w = w or 1,
-                h = h or 1,
+                w = dw,
+                h = dh,
+                path = path,
         }
+        imagePathCache[path] = img
+        return img
 end
 
 local function normText(text)
@@ -65449,7 +65666,7 @@ function love.keyboard.hasTextInput() return false end
 
 -- system ----------------------------------------------------------------------
 love.system = {}
-function love.system.getOS() return "Windows" end
+function love.system.getOS() return "Roblox" end
 
 -- window ----------------------------------------------------------------------
 love.window = {}
@@ -65533,6 +65750,198 @@ do
         end
 end
 
+
+--==============================================================================
+-- MENU CLICK HIT-TESTING (title / pause / settings / save / load / quit)
+--==============================================================================
+local function screenToGame(px, py)
+        local vw, vh, sc, offX, offY = computeViewport()
+        if sc <= 0 then sc = 1 end
+        local gx = (px - offX) / sc
+        local gy = (py - offY) / sc
+        return gx, gy
+end
+
+local lastMenuClickSel = nil
+local lastMenuClickTime = 0
+
+local function menuClickSelect(gx, gy)
+        -- Click selects an item. Confirm only on second click of the same item (or A/Space).
+        if not menu_enabled then return false end
+        local mt = menu_type
+        local now = (tick and tick()) or (os.clock and os.clock()) or 0
+
+        local function selectOnly(sel)
+                if type(m_select) == "function" then
+                        pcall(m_select, sel)
+                else
+                        m_selected = sel
+                end
+                -- soft SFX if available
+                if type(sfxplay2) == "function" and sfx2 then pcall(sfxplay2, sfx2) end
+                -- double-click same item within 0.45s = confirm
+                if lastMenuClickSel == sel and (now - lastMenuClickTime) < 0.45 then
+                        lastMenuClickSel = nil
+                        if type(menu_confirm) == "function" then pcall(menu_confirm) end
+                else
+                        lastMenuClickSel = sel
+                        lastMenuClickTime = now
+                end
+                return true
+        end
+
+        if mt == "title" then
+                if gx >= 520 and gx <= 1100 then
+                        if gy >= 400 and gy < 450 then return selectOnly(2) end -- New Game
+                        if gy >= 450 and gy < 492 then return selectOnly(3) end -- Load
+                        if gy >= 492 and gy < 534 then return selectOnly(4) end -- Settings
+                        if gy >= 534 and gy < 576 then return selectOnly(5) end -- Help
+                        if gy >= 576 and gy < 630 then return selectOnly(6) end -- Quit
+                end
+                return true -- absorb click on title so it does not confirm randomly
+        end
+
+        if mt == "pause" then
+                if gx >= 40 and gx <= 420 then
+                        for i = 0, 7 do
+                                local y0 = 373 + i * 42
+                                if gy >= y0 and gy < y0 + 42 then
+                                        return selectOnly(i + 2)
+                                end
+                        end
+                end
+                return true
+        end
+
+        if mt == "quityesno" or mt == "mainyesno" or mt == "choice" or mt == "language" or mt == "dialog" then
+                if gx >= 430 and gx <= 850 then
+                        for i = 1, 8 do
+                                local y0 = 195 + 50 * i
+                                if gy >= y0 and gy < y0 + 42 then
+                                        return selectOnly(i + 1)
+                                end
+                        end
+                end
+                return true
+        end
+
+        if mt == "settings" then
+                -- Explicit Back control (bottom-left / last row)
+                if (gx >= 40 and gx <= 280 and gy >= 640 and gy <= 700)
+                        or (gx >= 360 and gx <= 560 and gy >= 110 + 50 * 8 and gy < 110 + 50 * 8 + 32) then
+                        if type(menu_keypressed) == "function" then
+                                pcall(menu_keypressed, "b")
+                        end
+                        return true
+                end
+                -- Slider tracks (click sets value directly)
+                -- textspd bar at y~378, x 368..368+340
+                if gy >= 370 and gy <= 400 and gx >= 368 and gx <= 720 then
+                        local t = (gx - 368) / 1.7 + 50
+                        if t < 50 then t = 50 end
+                        if t > 250 then t = 250 end
+                        settings.textspd = math.floor(t / 25 + 0.5) * 25
+                        if type(m_select) == "function" then pcall(m_select, 2) end
+                        if type(savesettings) == "function" then pcall(savesettings) end
+                        return true
+                end
+                -- autospd bar y~446
+                if gy >= 438 and gy <= 468 and gx >= 368 and gx <= 720 then
+                        local t = (gx - 368) / 24.29 + 1
+                        if t < 1 then t = 1 end
+                        if t > 15 then t = 15 end
+                        settings.autospd = math.floor(t + 0.5)
+                        if type(m_select) == "function" then pcall(m_select, 3) end
+                        if type(savesettings) == "function" then pcall(savesettings) end
+                        return true
+                end
+                -- master vol y~378 x 818
+                if gy >= 370 and gy <= 400 and gx >= 818 and gx <= 1160 then
+                        local t = (gx - 818) / 3.4
+                        if t < 0 then t = 0 end
+                        if t > 100 then t = 100 end
+                        settings.masvol = math.floor(t / 10 + 0.5) * 10
+                        if type(m_select) == "function" then pcall(m_select, 6) end
+                        if type(game_setvolume) == "function" then pcall(game_setvolume) end
+                        if type(savesettings) == "function" then pcall(savesettings) end
+                        return true
+                end
+                if gy >= 438 and gy <= 468 and gx >= 818 and gx <= 1160 then
+                        local t = (gx - 818) / 3.4
+                        if t < 0 then t = 0 end
+                        if t > 100 then t = 100 end
+                        settings.bgmvol = math.floor(t / 10 + 0.5) * 10
+                        if type(m_select) == "function" then pcall(m_select, 7) end
+                        if type(game_setvolume) == "function" then pcall(game_setvolume) end
+                        if type(savesettings) == "function" then pcall(savesettings) end
+                        return true
+                end
+                if gy >= 506 and gy <= 536 and gx >= 818 and gx <= 1160 then
+                        local t = (gx - 818) / 3.4
+                        if t < 0 then t = 0 end
+                        if t > 100 then t = 100 end
+                        settings.sfxvol = math.floor(t / 10 + 0.5) * 10
+                        if type(m_select) == "function" then pcall(m_select, 8) end
+                        if type(game_setvolume) == "function" then pcall(game_setvolume) end
+                        if type(savesettings) == "function" then pcall(savesettings) end
+                        return true
+                end
+                -- Row labels (select only)
+                if gx >= 360 and gx <= 560 then
+                        for i = 1, 4 do
+                                local y0 = 110 + 50 * i
+                                if gy >= y0 and gy < y0 + 32 then
+                                        return selectOnly(i + 1)
+                                end
+                        end
+                elseif gx >= 800 and gx <= 1100 then
+                        for i = 1, 3 do
+                                local y0 = 110 + 50 * i
+                                if gy >= y0 and gy < y0 + 32 then
+                                        return selectOnly(i + 5)
+                                end
+                        end
+                end
+                return true
+        end
+
+        if mt == "savegame" or mt == "loadgame" then
+                local slots = {
+                        {2, 366, 200}, {3, 652, 200}, {4, 938, 200},
+                        {5, 366, 435}, {6, 652, 435}, {7, 938, 435},
+                }
+                for _, s in ipairs(slots) do
+                        local sel, sx, sy = s[1], s[2], s[3]
+                        if gx >= sx and gx <= sx + 256 and gy >= sy - 50 and gy <= sy + 120 then
+                                return selectOnly(sel)
+                        end
+                end
+                return true
+        end
+
+        if mt == "characters" then
+                if gx >= 360 and gx <= 700 then
+                        for i = 1, 5 do
+                                local y0 = 110 + 50 * i
+                                if gy >= y0 and gy < y0 + 32 then
+                                        return selectOnly(i + 1)
+                                end
+                        end
+                end
+                return true
+        end
+
+        if mt == "help" or mt == "history" then
+                if type(menu_keypressed) == "function" then
+                        pcall(menu_keypressed, "b")
+                        return true
+                end
+        end
+
+        return false
+end
+
+
 --==============================================================================
 -- INPUT (keyboard + touch)
 --==============================================================================
@@ -65545,13 +65954,16 @@ end
 
 local reportInputError -- assigned in the MAIN LOOP section below
 
+local lastFire = {}
+local FIRE_COOLDOWN = 0.12 -- seconds, prevents spam-advance
 local function fireKey(name)
+        local now = (tick and tick()) or (os.clock and os.clock()) or 0
+        local last = lastFire[name] or 0
+        if (now - last) < FIRE_COOLDOWN then return end
+        lastFire[name] = now
         if love.keypressed then
                 local ok, err = pcall(love.keypressed, name)
                 if not ok then
-                        -- v2: keypress errors used to be swallowed silently,
-                        -- which turned a failed module download into an
-                        -- unexplained black screen
                         if reportInputError then
                                 reportInputError("input", err)
                         else
@@ -65570,6 +65982,7 @@ do
                 KEYMAP[KC.Return] = "return"
                 KEYMAP[KC.Escape] = "escape"
                 KEYMAP[KC.Backspace] = "backspace"
+                KEYMAP[KC.LeftControl] = "escape"  -- Left Ctrl = back/cancel
                 KEYMAP[KC.Up] = "up"
                 KEYMAP[KC.Down] = "down"
                 KEYMAP[KC.Left] = "left"
@@ -65620,7 +66033,7 @@ do
                         end)
                 end
 
-                -- fullscreen tap catcher (advance / confirm)
+                -- fullscreen tap catcher (menu hit-test, else advance / confirm)
                 local catcher = Instance.new("TextButton")
                 catcher.Name = "DDLC_TapCatcher"
                 catcher.BackgroundTransparency = 1
@@ -65629,7 +66042,27 @@ do
                 catcher.Size = UDim2.fromScale(1, 1)
                 catcher.ZIndex = 900000
                 catcher.Parent = gui
-                bindButton(catcher, "space")
+                connect(catcher.InputBegan, function(io)
+                        if io.UserInputType ~= Enum.UserInputType.Touch
+                                and io.UserInputType ~= Enum.UserInputType.MouseButton1 then
+                                return
+                        end
+                        local pos = io.Position
+                        local gx, gy = screenToGame(pos.X, pos.Y)
+                        local handled = false
+                        local okh, res = pcall(menuClickSelect, gx, gy)
+                        if okh and res then handled = true end
+                        if not handled then
+                                keyStates["space"] = true
+                                fireKey("space")
+                        end
+                end)
+                connect(catcher.InputEnded, function(io)
+                        if io.UserInputType == Enum.UserInputType.Touch
+                                or io.UserInputType == Enum.UserInputType.MouseButton1 then
+                                keyStates["space"] = false
+                        end
+                end)
 
                 if touchOk and touchEnabled then
                         local pad = Instance.new("Frame")
@@ -65764,11 +66197,107 @@ session.love = love
 session.keyStates = keyStates
 session.backend = backendName
 
+
+--==============================================================================
+-- ASSET PRELOADER  (download + organize everything before the menu appears)
+--==============================================================================
+local function yieldFrame()
+        if type(task) == "table" and type(task.wait) == "function" then
+                pcall(task.wait, 0)
+        else
+                local ok, RS = pcall(function() return game:GetService("RunService") end)
+                if ok and RS then pcall(function() RS.Heartbeat:Wait() end) end
+        end
+end
+
+local function preloadAllAssets()
+        -- Build work list: skip fonts (approximated) and native-drawn PSEUDO GUI sheets
+        local jobs = {}
+        for path, _ in pairs(manifest) do
+                if path:sub(1, 13) == "assets/fonts/" then
+                        -- fonts are approximated by Roblox Enum.Font; no download needed
+                elseif PSEUDO[path] then
+                        -- redrawn natively
+                else
+                        local mapped = mapAssetURL(path)
+                        if mapped then
+                                jobs[#jobs + 1] = { gamePath = path, cdnPath = mapped }
+                        end
+                end
+        end
+        table.sort(jobs, function(a, b) return a.gamePath < b.gamePath end)
+
+        local total = #jobs
+        if total == 0 then
+                setStatus("No assets to preload.")
+                return
+        end
+
+        local okCount, failCount, skipCount = 0, 0, 0
+        setStatus(string.format("Preloading assets 0/%d ...", total))
+        print_(string.format("[DDLC-LOVE] Preloading %d assets into workspace/%sassets/", total, SAVE_DIR))
+
+        -- Fast path: only touch disk/network; warm getcustomasset later on first use
+        for i, job in ipairs(jobs) do
+                local org = organizedPath(job.cdnPath)
+                local ext = job.cdnPath:match("%.(%w+)$") or "bin"
+                local hashPath = SAVE_DIR .. "cache/" .. urlHash(job.cdnPath) .. "." .. ext
+                if isFile(org) or isFile(hashPath) then
+                        skipCount = skipCount + 1
+                else
+                        -- download only (getAssetURI writes organized + hash cache)
+                        local uri = getAssetURI(job.cdnPath, { skipUri = true })
+                        if uri or isFile(org) or isFile(hashPath) then
+                                okCount = okCount + 1
+                        else
+                                failCount = failCount + 1
+                                if failCount <= 8 then
+                                        warnOnce("preload miss: " .. job.gamePath)
+                                end
+                        end
+                end
+
+                -- yield less often for speed (every 12 files, or last)
+                if i % 12 == 0 or i == total then
+                        local done = okCount + failCount + skipCount
+                        setStatus(string.format(
+                                "Preloading assets %d/%d\nDownloaded: %d  Cached: %d  Failed: %d\n%s",
+                                done, total, okCount, skipCount, failCount, job.gamePath
+                        ))
+                        yieldFrame()
+                end
+        end
+
+        print_(string.format(
+                "[DDLC-LOVE] Preload done. new=%d cached=%d failed=%d (of %d)",
+                okCount, skipCount, failCount, total
+        ))
+        if failCount > 0 then
+                setStatus(string.format(
+                        "Preload finished with %d missing assets.\nGame will still run; those files stay blank/silent.",
+                        failCount
+                ))
+                yieldFrame()
+                if type(task) == "table" and type(task.wait) == "function" then pcall(task.wait, 1.2) end
+        else
+                setStatus(string.format("All %d assets ready.", total))
+                yieldFrame()
+        end
+end
+
 --==============================================================================
 -- BOOT
 --==============================================================================
 local function boot()
-        setStatus("DDLC-LOVE (Roblox port)\nLoading...")
+        setStatus("DDLC-LOVE (Roblox port)\nPreparing asset download...")
+        -- Download + organize every image/audio asset before the menu appears
+        local okPre, preErr = pcall(preloadAllAssets)
+        if not okPre then
+                warn_("[DDLC-LOVE] preload error: " .. tostring(preErr))
+                setStatus("Asset preload had an error.\nContinuing anyway...\n" .. tostring(preErr))
+                if type(task) == "table" and type(task.wait) == "function" then pcall(task.wait, 1.5) end
+        end
+        setStatus("DDLC-LOVE (Roblox port)\nLoading game...")
         local src = fsRead("main.lua")
         if not src then
                 setStatus("[DDLC-LOVE] Could not load main.lua.\n"
@@ -65797,6 +66326,34 @@ local function boot()
         local RunService = game:GetService("RunService")
         local okc, conn = pcall(function() return RunService.Heartbeat:Connect(step) end)
         if okc and conn then hbConn = conn else step(1 / 60) end
+        
+        -- Safety: ensure player name is never empty on this port so New Game never stalls
+        if type(player) ~= "string" or player == "" then
+                player = "Player"
+        end
+        -- Reset skip/auto so dialogue is not already racing
+        if type(autoskip) == "number" then autoskip = 0 end
+        if type(autotimer) == "number" then autotimer = 0 end
+
+
+        -- Re-bind filesystem helpers the game may have overwritten
+        do
+                local _read = love.filesystem.read
+                local _write = love.filesystem.write
+                function love.filesystem.getInfo(name)
+                        local data = _read and _read(name)
+                        if data ~= nil and data ~= false then
+                                return { type = "file", size = #tostring(data) }
+                        end
+                        return nil
+                end
+                function love.filesystem.load(name)
+                        local data = _read and _read(name)
+                        if not data then return nil end
+                        return loadstring(data, "@" .. tostring(name))
+                end
+        end
+
         print_("[DDLC-LOVE] Roblox port ready (v2, game code embedded). backend="
                 .. backendName .. "  saves: workspace/" .. SAVE_DIR)
 end
